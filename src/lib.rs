@@ -1,8 +1,9 @@
 pub mod archive;
 pub mod crypto;
+pub mod extract;
 pub mod qt;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -10,14 +11,18 @@ pub enum Error {
     InvalidData(String),
     #[error("unsupported Qt QVariant type id: {0}")]
     UnsupportedVariant(u32),
-    #[error("CopyQ archive version {0} is not supported yet")]
-    UnsupportedVersion(u8),
+    #[error("output path already exists: {0}")]
+    OutputExists(PathBuf),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
-pub fn extract(_input: &Path, _output: &Path, _password: Option<&str>) -> Result<(), Error> {
-    Err(Error::InvalidData(
-        "archive decoder is not connected yet".into(),
-    ))
+pub fn extract(
+    input: &Path,
+    output: &Path,
+    password: Option<&str>,
+) -> Result<extract::ExtractionSummary, Error> {
+    extract::extract(input, output, password)
 }

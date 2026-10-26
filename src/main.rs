@@ -31,8 +31,16 @@ fn main() {
         None => None,
     };
 
-    if let Err(error) = cpq_extract::extract(&args.archive, &args.output, password.as_deref()) {
-        eprintln!("Error: {error}");
-        std::process::exit(1);
+    match cpq_extract::extract(&args.archive, &args.output, password.as_deref()) {
+        Ok(summary) => println!(
+            "Extracted {} items from {} tabs to {}",
+            summary.item_count,
+            summary.tab_count,
+            summary.output.display()
+        ),
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
     }
 }
