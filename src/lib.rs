@@ -1,13 +1,19 @@
+pub mod qt;
+
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("CPQ decoder is not implemented yet")]
-    NotImplemented,
+    #[error("invalid CopyQ data: {0}")]
+    InvalidData(String),
+    #[error("unsupported Qt QVariant type id: {0}")]
+    UnsupportedVariant(u32),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 pub fn extract(_input: &Path, _output: &Path, _password: Option<&str>) -> Result<(), Error> {
-    Err(Error::NotImplemented)
+    Err(Error::InvalidData(
+        "archive decoder is not connected yet".into(),
+    ))
 }
