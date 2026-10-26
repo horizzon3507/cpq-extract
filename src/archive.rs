@@ -282,7 +282,7 @@ impl<'a> ItemReader<'a> {
 
 fn read_item_count<R: Read>(reader: &mut QtReader<R>) -> Result<u32, Error> {
     let count = reader.read_i32()?;
-    if count < 0 || count > MAX_ITEMS {
+    if !(0..=MAX_ITEMS).contains(&count) {
         return Err(Error::InvalidData(format!(
             "invalid item count in tab: {count}"
         )));
@@ -294,7 +294,7 @@ fn read_item_data<R: Read>(reader: &mut QtReader<R>) -> Result<ClipboardItem, Er
     let mut count = reader.read_i32()?;
     if count == -2 {
         count = reader.read_i32()?;
-        if count < 0 || count > MAX_FORMATS {
+        if !(0..=MAX_FORMATS).contains(&count) {
             return Err(Error::InvalidData(format!(
                 "invalid format count in item: {count}"
             )));
@@ -319,7 +319,7 @@ fn read_item_data<R: Read>(reader: &mut QtReader<R>) -> Result<ClipboardItem, Er
             "unexpected encrypted data marker inside tab items".into(),
         ));
     }
-    if count < 0 || count > MAX_FORMATS {
+    if !(0..=MAX_FORMATS).contains(&count) {
         return Err(Error::InvalidData(format!(
             "invalid legacy format count in item: {count}"
         )));
@@ -448,7 +448,7 @@ fn read_serialized_items<R: Read>(
     reader: &mut QtReader<R>,
 ) -> Result<BTreeMap<String, Vec<u8>>, Error> {
     let count = reader.read_i32()?;
-    if count < 0 || count > MAX_FORMATS {
+    if !(0..=MAX_FORMATS).contains(&count) {
         return Err(Error::InvalidData(format!(
             "invalid serialized format count: {count}"
         )));

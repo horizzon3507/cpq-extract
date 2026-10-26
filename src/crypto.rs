@@ -79,7 +79,7 @@ pub fn decrypt_envelope(payload: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, 
     let decryptor = Aes256CbcDec::new_from_slices(&*message_key, iv)
         .map_err(|_| Error::InvalidData("could not initialize AES-256-CBC".into()))?;
     decryptor
-        .decrypt_padded_vec_mut::<Pkcs7>(&mut ciphertext.to_vec())
+        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
         .map_err(|_| Error::InvalidData("wrong password or corrupted encrypted block".into()))
 }
 

@@ -31,6 +31,20 @@ pub enum QtValue {
 }
 
 impl QtValue {
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Self::Null => false,
+            Self::Bool(value) => *value,
+            Self::I64(value) => *value != 0,
+            Self::U64(value) => *value != 0,
+            Self::F64(value) => *value != 0.0 && !value.is_nan(),
+            Self::String(value) => !value.is_empty(),
+            Self::Bytes(value) => !value.is_empty(),
+            Self::List(value) => !value.is_empty(),
+            Self::Map(value) => !value.is_empty(),
+        }
+    }
+
     pub fn to_json(&self) -> Value {
         match self {
             Self::Null => Value::Null,

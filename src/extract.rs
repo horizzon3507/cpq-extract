@@ -171,7 +171,7 @@ fn write_json(path: &Path, value: &serde_json::Value) -> Result<(), Error> {
 fn safe_component(value: &str) -> String {
     let normalized: String = value.nfkc().collect();
     let normalized = normalized.trim();
-    let mut component: String = normalized
+    let component: String = normalized
         .chars()
         .map(|character| {
             if character.is_alphanumeric() || matches!(character, '-' | '_') {
@@ -180,11 +180,12 @@ fn safe_component(value: &str) -> String {
                 '_'
             }
         })
+        .collect();
+    let component: String = component
+        .trim_matches(|character| matches!(character, '.' | '_' | '-'))
+        .chars()
         .take(72)
         .collect();
-    component = component
-        .trim_matches(|character| matches!(character, '.' | '_' | '-'))
-        .to_owned();
     if component.is_empty() {
         "tab".into()
     } else {
@@ -349,6 +350,9 @@ mod tests {
         let settings: Value =
             serde_json::from_slice(&fs::read(output_path.join("settings.json")).unwrap()).unwrap();
         assert_eq!(settings["Fixture/flag"], "v5 settings");
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(output_path.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["has_settings"], true);
     }
 
     #[test]
