@@ -2,10 +2,9 @@
 name = "cpq-extract"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 description = "Extract CopyQ .cpq backups into ordered files by tab and item"
 readme = "README.md"
-license = "GPL-3.0-or-later"
 
 [dependencies]
 aes = "0.8.4"

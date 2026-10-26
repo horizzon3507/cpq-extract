@@ -1,41 +1,48 @@
 # CPQ Extractor
 
-Utilitário local para extrair backups `.cpq` do CopyQ. Ele mantém a ordem dos itens, separa as abas em diretórios e grava cada formato de clipboard como um arquivo, com um `manifest.json` relacionando item, MIME type e nome do arquivo.
+`cpq-extract` é um utilitário de linha de comando em Rust que extrai backups `.cpq` do CopyQ para arquivos ordenados por aba e item.
 
-## Uso
+## Compilar e executar
 
-Requer Python 3.10 ou mais recente, PyQt5 e `cryptography`. A partir da pasta raiz deste repositório, rode diretamente:
-
-```sh
-python3 -m exitq.decoder exitq/cop.cpq cpq-extraido
-```
-
-Não é necessário instalar o projeto para usar esse comando. Para criar o comando `cpq-extract`, instale em um ambiente virtual:
+Requer Rust 1.85 ou mais recente.
 
 ```sh
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install .
-cpq-extract exitq/cop.cpq cpq-extraido
+cargo build --release
+./target/release/cpq-extract backup.cpq cpq-extraido
 ```
 
-Backups criptografados pedem a senha no terminal sem mostrá-la na tela. A senha não é gravada. A pasta de destino precisa ainda não existir; isso evita misturar a extração com arquivos preexistentes.
+Para instalar o executável no diretório de binários do Cargo:
 
-## Estrutura de saída
+```sh
+cargo install --path .
+cpq-extract backup.cpq cpq-extraido
+```
+
+Backups v5 criptografados pedem a senha sem exibi-la no terminal. Para uso em scripts, passe um arquivo com a senha:
+
+```sh
+cpq-extract backup.cpq cpq-extraido --password-file senha.txt
+```
+
+A pasta de destino ainda não pode existir. O extrator grava primeiro em uma pasta temporária e a move para o destino quando termina.
+
+## Arquivos extraídos
 
 ```text
 cpq-extraido/
 ├── manifest.json
-├── settings.json             # se o backup contiver configurações
-├── commands.json             # se o backup contiver comandos
+├── settings.json             # quando o backup inclui configurações
+├── commands.json             # quando o backup inclui comandos
 ├── 001_clipboard/
 │   ├── 000001.txt
 │   ├── 000001.html
 │   └── 000002.png
-└── 002_notes/
+└── 002_Anotações/
     └── 000001.md
 ```
 
-Os nomes numéricos seguem a ordem dos itens dentro da aba no backup. As extensões vêm do MIME type: `text/plain` vira `.txt`, `text/markdown` vira `.md`, e imagens mantêm extensões como `.png`, `.jpg` ou `.svg`. Formatos desconhecidos são preservados como `.bin`; o MIME original aparece no manifesto. Um item pode gerar vários arquivos, um para cada formato que o CopyQ guardou.
+Os itens mantêm a ordem dentro de cada aba. Cada formato MIME salvo vira um arquivo; tipos comuns usam extensões como `.txt`, `.md`, `.html`, `.png` e `.jpg`. Formatos desconhecidos recebem a extensão `.bin`. O `manifest.json` relaciona cada item ao MIME type, ao caminho e ao tamanho dos arquivos. Um item pode gerar vários arquivos.
 
-O decodificador entende exports CopyQ v1 a v5. A estrutura binária usa `QDataStream` do Qt; exports v5 com senha usam a criptografia do CopyQ. Caminhos de arquivo encontrados dentro do backup são preservados como referências e nunca são abertos pelo extrator.
+O extrator entende backups CopyQ v1 a v5, incluindo exports v5 criptografados. Caminhos de arquivos guardados como referências são preservados como dados; o extrator nunca abre esses caminhos.
+
+As versões v1 e v2 podem ser lidas item por item. As versões v3 a v5 armazenam os dados de cada aba em blocos Qt, então o uso de memória pode chegar ao tamanho da maior aba. A v3 armazena os blocos das abas juntos e pode exigir memória próxima ao tamanho do backup.
