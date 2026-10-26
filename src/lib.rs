@@ -5,6 +5,8 @@ pub mod qt;
 
 use std::path::{Path, PathBuf};
 
+pub use extract::ExtractionSummary;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("invalid CopyQ data: {0}")]
@@ -23,6 +25,6 @@ pub fn extract(
     input: &Path,
     output: &Path,
     password: Option<&str>,
-) -> Result<extract::ExtractionSummary, Error> {
+) -> Result<ExtractionSummary, Error> {
     extract::extract(input, output, password)
 }

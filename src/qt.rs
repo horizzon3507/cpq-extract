@@ -1,3 +1,4 @@
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::io::{BufRead, Read};
 
@@ -192,12 +193,13 @@ impl<R: Read> QtReader<R> {
             .map_err(|_| Error::InvalidData("QString does not fit in memory".into()))?;
         let mut bytes = vec![0; length];
         self.read_exact(&mut bytes, "QString payload")?;
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-            .collect();
-        String::from_utf16(&units)
-            .map_err(|_| Error::InvalidData("QString contains invalid UTF-16".into()))
+        char::decode_utf16(
+            bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]])),
+        )
+        .collect::<Result<String, _>>()
+        .map_err(|_| Error::InvalidData("QString contains invalid UTF-16".into()))
     }
 
     pub fn read_qstring_list(&mut self) -> Result<Vec<String>, Error> {
@@ -206,18 +208,7 @@ impl<R: Read> QtReader<R> {
     }
 
     pub fn read_qvariant_map(&mut self) -> Result<BTreeMap<String, QtValue>, Error> {
-        let count = self.read_count("QVariantMap")?;
-        let mut values = BTreeMap::new();
-        for _ in 0..count {
-            let key = self.read_qstring()?;
-            let value = self.read_variant_at_depth(0)?;
-            if values.insert(key.clone(), value).is_some() {
-                return Err(Error::InvalidData(format!(
-                    "duplicate QVariantMap key: {key}"
-                )));
-            }
-        }
-        Ok(values)
+        self.read_qvariant_map_at_depth(0)
     }
 
     pub fn read_variant(&mut self) -> Result<QtValue, Error> {
@@ -285,10 +276,16 @@ impl<R: Read> QtReader<R> {
         for _ in 0..count {
             let key = self.read_qstring()?;
             let value = self.read_variant_at_depth(depth)?;
-            if values.insert(key.clone(), value).is_some() {
-                return Err(Error::InvalidData(format!(
-                    "duplicate QVariantMap key: {key}"
-                )));
+            match values.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(value);
+                }
+                Entry::Occupied(entry) => {
+                    return Err(Error::InvalidData(format!(
+                        "duplicate QVariantMap key: {}",
+                        entry.key()
+                    )));
+                }
             }
         }
         Ok(values)

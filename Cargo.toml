@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "Extract CopyQ .cpq backups into ordered files by tab and item"
 readme = "README.md"
+repository = "https://github.com/horizzon3507/cpq-extract"
 
 [dependencies]
 aes = "0.8.4"

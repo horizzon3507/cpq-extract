@@ -1,13 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use tempfile::Builder;
+use tempfile::{Builder, TempDir};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::archive::ArchiveReader;
+use crate::archive::{ArchiveReader, ItemReader};
 use crate::qt::QtValue;
 use crate::Error;
 
@@ -38,13 +38,54 @@ pub fn extract(
     password: Option<&str>,
 ) -> Result<ExtractionSummary, Error> {
     let output = absolute_path(output)?;
-    match fs::symlink_metadata(&output) {
-        Ok(_) => return Err(Error::OutputExists(output)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    ensure_output_is_new(&output)?;
 
     let mut archive = ArchiveReader::open_with_password(input, password)?;
+    let staging = create_staging_directory(&output)?;
+    let staging_path = staging.path().to_owned();
+    let mut manifest = BufWriter::new(create_new(&staging_path.join("manifest.json"))?);
+    write_manifest_header(&mut manifest, archive.version())?;
+
+    let mut total_items = 0_u64;
+    let tab_count = archive.for_each_tab(|tab_index, tab_name, items| {
+        write_tab(
+            &mut manifest,
+            &staging_path,
+            tab_index,
+            tab_name,
+            items,
+            &mut total_items,
+        )
+    })?;
+
+    write_manifest_metadata(
+        &mut manifest,
+        &staging_path,
+        archive.metadata(),
+        total_items,
+    )?;
+    manifest.flush()?;
+    drop(manifest);
+
+    publish_staging_directory(staging, &output)?;
+
+    Ok(ExtractionSummary {
+        archive_version: archive.version(),
+        tab_count,
+        item_count: total_items,
+        output,
+    })
+}
+
+fn ensure_output_is_new(output: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(output) {
+        Ok(_) => Err(Error::OutputExists(output.to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn create_staging_directory(output: &Path) -> Result<TempDir, Error> {
     let parent = output
         .parent()
         .ok_or_else(|| Error::InvalidData("output directory has no parent".into()))?;
@@ -54,68 +95,82 @@ pub fn extract(
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .ok_or_else(|| Error::InvalidData("output directory has an invalid name".into()))?;
-    let staging = Builder::new()
+    Ok(Builder::new()
         .prefix(&format!(".{name}.tmp-"))
-        .tempdir_in(parent)?;
-    let staging_path = staging.path().to_owned();
-    let mut manifest = BufWriter::new(create_new(&staging_path.join("manifest.json"))?);
+        .tempdir_in(parent)?)
+}
+
+fn write_manifest_header(manifest: &mut BufWriter<File>, archive_version: u8) -> Result<(), Error> {
     write!(
         manifest,
-        "{{\n  \"format\": \"CopyQ CPQ\",\n  \"archive_version\": {},\n  \"tabs\": [",
-        archive.version()
+        "{{\n  \"format\": \"CopyQ CPQ\",\n  \"archive_version\": {archive_version},\n  \"tabs\": ["
     )?;
+    Ok(())
+}
 
-    let mut total_items = 0_u64;
-    let tab_count = archive.for_each_tab(|tab_index, tab_name, items| {
-        let directory = format!("{tab_index:03}_{}", safe_component(tab_name));
-        let tab_path = staging_path.join(&directory);
-        fs::create_dir(&tab_path)?;
-        if tab_index > 1 {
+fn write_tab(
+    manifest: &mut BufWriter<File>,
+    staging_path: &Path,
+    tab_index: usize,
+    tab_name: &str,
+    items: &mut ItemReader<'_>,
+    total_items: &mut u64,
+) -> Result<(), Error> {
+    let directory = format!("{tab_index:03}_{}", safe_component(tab_name));
+    let tab_path = staging_path.join(&directory);
+    fs::create_dir(&tab_path)?;
+    if tab_index > 1 {
+        write!(manifest, ",")?;
+    }
+    write!(manifest, "\n    {{\"index\": {tab_index}, \"name\":")?;
+    serde_json::to_writer(&mut *manifest, tab_name)?;
+    write!(manifest, ", \"directory\":")?;
+    serde_json::to_writer(&mut *manifest, &directory)?;
+    write!(manifest, ", \"items\": [")?;
+
+    let mut item_count = 0_u32;
+    while let Some(formats) = items.next_item()? {
+        item_count += 1;
+        *total_items += 1;
+        let mut used_filenames = HashSet::new();
+        let mut files = Vec::with_capacity(formats.len());
+        for (mime, payload) in &formats {
+            let extension = file_extension(mime);
+            let filename = unique_filename(item_count, &extension, &mut used_filenames);
+            let mut output_file = create_new(&tab_path.join(&filename))?;
+            output_file.write_all(payload)?;
+            files.push(ManifestFile {
+                mime,
+                file: format!("{directory}/{filename}"),
+                bytes: payload.len(),
+            });
+        }
+        if item_count > 1 {
             write!(manifest, ",")?;
         }
-        write!(manifest, "\n    {{\"index\": {tab_index}, \"name\":")?;
-        serde_json::to_writer(&mut manifest, tab_name)?;
-        write!(manifest, ", \"directory\":")?;
-        serde_json::to_writer(&mut manifest, &directory)?;
-        write!(manifest, ", \"items\": [")?;
+        write!(manifest, "\n      ")?;
+        serde_json::to_writer(
+            &mut *manifest,
+            &ManifestItem {
+                index: item_count,
+                files,
+            },
+        )?;
+    }
 
-        let mut item_count = 0_u32;
-        while let Some(formats) = items.next_item()? {
-            item_count += 1;
-            total_items += 1;
-            let mut used_filenames = HashSet::new();
-            let mut files = Vec::with_capacity(formats.len());
-            for (mime, payload) in &formats {
-                let extension = file_extension(mime);
-                let filename = unique_filename(item_count, &extension, &mut used_filenames);
-                let mut output_file = create_new(&tab_path.join(&filename))?;
-                output_file.write_all(payload)?;
-                files.push(ManifestFile {
-                    mime,
-                    file: format!("{directory}/{filename}"),
-                    bytes: payload.len(),
-                });
-            }
-            if item_count > 1 {
-                write!(manifest, ",")?;
-            }
-            write!(manifest, "\n      ")?;
-            serde_json::to_writer(
-                &mut manifest,
-                &ManifestItem {
-                    index: item_count,
-                    files,
-                },
-            )?;
-        }
+    write!(manifest, "], \"item_count\": {item_count}}}")?;
+    Ok(())
+}
 
-        write!(manifest, "], \"item_count\": {item_count}}}")?;
-        Ok(())
-    })?;
-
+fn write_manifest_metadata(
+    manifest: &mut BufWriter<File>,
+    staging_path: &Path,
+    metadata: &BTreeMap<String, QtValue>,
+    total_items: u64,
+) -> Result<(), Error> {
     write!(manifest, "\n  ],\n")?;
-    let settings = archive.metadata().get("settings");
-    let commands = archive.metadata().get("commands");
+    let settings = metadata.get("settings");
+    let commands = metadata.get("commands");
     let has_settings = settings.is_some_and(QtValue::is_truthy);
     let command_count = match commands {
         Some(QtValue::List(values)) => values.len(),
@@ -131,21 +186,16 @@ pub fn extract(
         manifest,
         "  \"total_items\": {total_items},\n  \"has_settings\": {has_settings},\n  \"command_count\": {command_count}\n}}\n"
     )?;
-    manifest.flush()?;
-    drop(manifest);
+    Ok(())
+}
 
+fn publish_staging_directory(staging: TempDir, output: &Path) -> Result<(), Error> {
     let staging_path = staging.keep();
-    if let Err(error) = fs::rename(&staging_path, &output) {
+    if let Err(error) = fs::rename(&staging_path, output) {
         let _ = fs::remove_dir_all(&staging_path);
         return Err(error.into());
     }
-
-    Ok(ExtractionSummary {
-        archive_version: archive.version(),
-        tab_count,
-        item_count: total_items,
-        output,
-    })
+    Ok(())
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, Error> {
@@ -194,9 +244,12 @@ fn safe_component(value: &str) -> String {
 }
 
 fn file_extension(mime: &str) -> String {
-    let mime_lower = mime.to_ascii_lowercase();
-    let mime_without_parameters = mime.split(';').next().unwrap_or_default().trim();
-    let normalized_mime = mime_without_parameters.to_ascii_lowercase();
+    let normalized_mime = mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     let special = match normalized_mime.as_str() {
         "application/x-copyq-item-notes" => Some("notes.txt"),
         "application/x-copyq-window-title" => Some("window-title.txt"),
@@ -230,7 +283,7 @@ fn file_extension(mime: &str) -> String {
         }
     }
 
-    let slug = safe_component(&mime_lower.replace(['/', '+'], "-")).to_ascii_lowercase();
+    let slug = safe_component(&mime.replace(['/', '+'], "-")).to_ascii_lowercase();
     format!(
         "format-{}.bin",
         if slug.is_empty() { "unknown" } else { &slug }

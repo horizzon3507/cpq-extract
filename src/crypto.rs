@@ -14,6 +14,11 @@ const PASSWORD_ITERATIONS: u32 = 100_000;
 const ENVELOPE_MAGIC: &[u8] = b"CPQ1";
 const MESSAGE_KEY_INFO: &[u8] = b"copyq-msg-key-v1";
 const HMAC_KEY_INFO: &[u8] = b"copyq-hmac-v1";
+const SALT_LENGTH: usize = 16;
+const AES_BLOCK_LENGTH: usize = 16;
+const AUTH_TAG_LENGTH: usize = 32;
+const ENVELOPE_HEADER_LENGTH: usize = ENVELOPE_MAGIC.len() + SALT_LENGTH + AES_BLOCK_LENGTH;
+const MIN_ENVELOPE_LENGTH: usize = ENVELOPE_HEADER_LENGTH + AES_BLOCK_LENGTH + AUTH_TAG_LENGTH;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
@@ -37,15 +42,17 @@ impl EncryptionKey {
 }
 
 pub fn decrypt_envelope(payload: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, Error> {
-    const MIN_ENVELOPE_SIZE: usize = 4 + 16 + 16 + 16 + 32;
-    if payload.len() < MIN_ENVELOPE_SIZE || !payload.starts_with(ENVELOPE_MAGIC) {
+    if payload.len() < MIN_ENVELOPE_LENGTH || !payload.starts_with(ENVELOPE_MAGIC) {
         return Err(Error::InvalidData(
             "encrypted block does not have a valid CopyQ envelope".into(),
         ));
     }
 
-    let signed_end = payload.len() - 32;
-    let salt = &payload[4..20];
+    let salt_start = ENVELOPE_MAGIC.len();
+    let iv_start = salt_start + SALT_LENGTH;
+    let ciphertext_start = iv_start + AES_BLOCK_LENGTH;
+    let signed_end = payload.len() - AUTH_TAG_LENGTH;
+    let salt = &payload[salt_start..iv_start];
     let message_hkdf = Hkdf::<Sha256>::new(Some(salt), key.bytes());
     let mut message_key = Zeroizing::new([0_u8; 32]);
     message_hkdf
@@ -66,11 +73,11 @@ pub fn decrypt_envelope(payload: &[u8], key: &EncryptionKey) -> Result<Vec<u8>, 
         .verify_slice(&payload[signed_end..])
         .map_err(|_| Error::InvalidData("wrong password or corrupted encrypted block".into()))?;
 
-    let iv: &[u8; 16] = payload[20..36]
+    let iv: &[u8; AES_BLOCK_LENGTH] = payload[iv_start..ciphertext_start]
         .try_into()
         .map_err(|_| Error::InvalidData("encrypted block has an invalid AES IV".into()))?;
-    let ciphertext = &payload[36..signed_end];
-    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+    let ciphertext = &payload[ciphertext_start..signed_end];
+    if ciphertext.is_empty() || ciphertext.len() % AES_BLOCK_LENGTH != 0 {
         return Err(Error::InvalidData(
             "encrypted block has invalid AES ciphertext length".into(),
         ));

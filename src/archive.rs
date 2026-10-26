@@ -12,7 +12,9 @@ use crate::Error;
 
 const MAX_ITEMS: i32 = 100_000;
 const MAX_FORMATS: i32 = 10_000;
+const MAX_TABS: usize = 10_000;
 const MAX_DATA_BLOCK: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_INITIAL_DECOMPRESSED_CAPACITY: usize = 16 * 1024 * 1024;
 
 pub type ClipboardItem = BTreeMap<String, Vec<u8>>;
 
@@ -82,10 +84,10 @@ impl ArchiveReader {
                     None => Vec::new(),
                     _ => return Err(Error::InvalidData("invalid v3 tab list".into())),
                 };
-                if raw_tabs.len() > 10_000 {
-                    return Err(Error::InvalidData(
-                        "v3 archive contains more than 10,000 tabs".into(),
-                    ));
+                if raw_tabs.len() > MAX_TABS {
+                    return Err(Error::InvalidData(format!(
+                        "v3 archive contains more than {MAX_TABS} tabs"
+                    )));
                 }
                 for raw_tab in raw_tabs {
                     let QtValue::Map(mut fields) = raw_tab else {
@@ -101,11 +103,13 @@ impl ArchiveReader {
                 reader.set_version(StreamVersion::Qt5_15);
                 let marker = reader.read_i32()?;
                 if marker == -3 {
-                    let password = match password {
-                        Some(password) => password.to_owned(),
-                        None => prompt_password("CopyQ backup password: ")?,
-                    };
-                    v5_key = Some(EncryptionKey::from_password(&password));
+                    v5_key = Some(match password {
+                        Some(password) => EncryptionKey::from_password(password),
+                        None => {
+                            let password = prompt_password("CopyQ backup password: ")?;
+                            EncryptionKey::from_password(&password)
+                        }
+                    });
                 }
                 let raw_metadata =
                     read_serialized_data_after_marker(&mut reader, marker, v5_key.as_ref())?;
@@ -115,10 +119,10 @@ impl ArchiveReader {
                     None => Vec::new(),
                     _ => return Err(Error::InvalidData("invalid v5 tab list".into())),
                 };
-                if raw_names.len() > 10_000 {
-                    return Err(Error::InvalidData(
-                        "v5 archive contains more than 10,000 tabs".into(),
-                    ));
+                if raw_names.len() > MAX_TABS {
+                    return Err(Error::InvalidData(format!(
+                        "v5 archive contains more than {MAX_TABS} tabs"
+                    )));
                 }
                 v5_tab_names = raw_names
                     .into_iter()
@@ -157,72 +161,89 @@ impl ArchiveReader {
         F: FnMut(usize, &str, &mut ItemReader<'_>) -> Result<(), Error>,
     {
         match self.version {
-            1 | 2 => {
-                if self.direct_tab_read {
-                    return Ok(1);
-                }
-                self.direct_tab_read = true;
-                let name = self
-                    .legacy_tab_name
-                    .clone()
-                    .unwrap_or_else(|| "clipboard".into());
-                let mut items = ItemReader::from_direct(&mut self.reader)?;
-                visit(1, &name, &mut items)?;
-                items.ensure_finished()?;
-                Ok(1)
-            }
-            3 => {
-                let tab_count = self.v3_tabs.len();
-                for index in 0..tab_count {
-                    let (name, data) = self.v3_tabs[index]
-                        .take()
-                        .ok_or_else(|| Error::InvalidData("v3 tab data already consumed".into()))?;
-                    let mut items = ItemReader::from_buffered(data)?;
-                    visit(index + 1, &name, &mut items)?;
-                    items.ensure_finished()?;
-                }
-                Ok(tab_count)
-            }
-            4 => {
-                let mut tab_count = 0;
-                while !self.reader.at_end()? {
-                    let mut fields = self.reader.read_qvariant_map()?;
-                    let name = take_string(fields.remove("name"), "v4 tab name")?;
-                    let data = take_bytes(fields.remove("data"), "v4 tab data")?;
-                    let mut items = ItemReader::from_buffered(data)?;
-                    tab_count += 1;
-                    visit(tab_count, &name, &mut items)?;
-                    items.ensure_finished()?;
-                }
-                Ok(tab_count)
-            }
-            5 => {
-                while self.v5_next_tab < self.v5_tab_names.len() {
-                    let tab_number = self.v5_next_tab + 1;
-                    let name = self.v5_tab_names[self.v5_next_tab].clone();
-                    self.v5_next_tab += 1;
-                    let marker = self.reader.read_i32()?;
-                    let mut fields = read_serialized_data_after_marker(
-                        &mut self.reader,
-                        marker,
-                        self.v5_key.as_ref(),
-                    )?;
-                    let data = fields.remove("data").ok_or_else(|| {
-                        Error::InvalidData("missing or invalid v5 tab data".into())
-                    })?;
-                    let mut items = ItemReader::from_buffered(data)?;
-                    visit(tab_number, &name, &mut items)?;
-                    items.ensure_finished()?;
-                }
-                if !self.reader.at_end()? {
-                    return Err(Error::InvalidData(
-                        "unexpected trailing data after v5 tabs".into(),
-                    ));
-                }
-                Ok(self.v5_next_tab)
-            }
+            1 | 2 => self.visit_legacy_tab(&mut visit),
+            3 => self.visit_v3_tabs(&mut visit),
+            4 => self.visit_v4_tabs(&mut visit),
+            5 => self.visit_v5_tabs(&mut visit),
             _ => unreachable!(),
         }
+    }
+
+    fn visit_legacy_tab<F>(&mut self, visit: &mut F) -> Result<usize, Error>
+    where
+        F: FnMut(usize, &str, &mut ItemReader<'_>) -> Result<(), Error>,
+    {
+        if self.direct_tab_read {
+            return Ok(1);
+        }
+        self.direct_tab_read = true;
+
+        let name = self.legacy_tab_name.as_deref().unwrap_or("clipboard");
+        let mut items = ItemReader::from_direct(&mut self.reader)?;
+        visit(1, name, &mut items)?;
+        items.ensure_finished()?;
+        Ok(1)
+    }
+
+    fn visit_v3_tabs<F>(&mut self, visit: &mut F) -> Result<usize, Error>
+    where
+        F: FnMut(usize, &str, &mut ItemReader<'_>) -> Result<(), Error>,
+    {
+        let tab_count = self.v3_tabs.len();
+        for index in 0..tab_count {
+            let (name, data) = self.v3_tabs[index]
+                .take()
+                .ok_or_else(|| Error::InvalidData("v3 tab data already consumed".into()))?;
+            let mut items = ItemReader::from_buffered(data)?;
+            visit(index + 1, &name, &mut items)?;
+            items.ensure_finished()?;
+        }
+        Ok(tab_count)
+    }
+
+    fn visit_v4_tabs<F>(&mut self, visit: &mut F) -> Result<usize, Error>
+    where
+        F: FnMut(usize, &str, &mut ItemReader<'_>) -> Result<(), Error>,
+    {
+        let mut tab_count = 0;
+        while !self.reader.at_end()? {
+            let mut fields = self.reader.read_qvariant_map()?;
+            let name = take_string(fields.remove("name"), "v4 tab name")?;
+            let data = take_bytes(fields.remove("data"), "v4 tab data")?;
+            let mut items = ItemReader::from_buffered(data)?;
+            tab_count += 1;
+            visit(tab_count, &name, &mut items)?;
+            items.ensure_finished()?;
+        }
+        Ok(tab_count)
+    }
+
+    fn visit_v5_tabs<F>(&mut self, visit: &mut F) -> Result<usize, Error>
+    where
+        F: FnMut(usize, &str, &mut ItemReader<'_>) -> Result<(), Error>,
+    {
+        while self.v5_next_tab < self.v5_tab_names.len() {
+            let tab_index = self.v5_next_tab;
+            let tab_number = tab_index + 1;
+            let name = &self.v5_tab_names[tab_index];
+            self.v5_next_tab += 1;
+
+            let marker = self.reader.read_i32()?;
+            let mut fields =
+                read_serialized_data_after_marker(&mut self.reader, marker, self.v5_key.as_ref())?;
+            let data = fields
+                .remove("data")
+                .ok_or_else(|| Error::InvalidData("missing or invalid v5 tab data".into()))?;
+            let mut items = ItemReader::from_buffered(data)?;
+            visit(tab_number, name, &mut items)?;
+            items.ensure_finished()?;
+        }
+        if !self.reader.at_end()? {
+            return Err(Error::InvalidData(
+                "unexpected trailing data after v5 tabs".into(),
+            ));
+        }
+        Ok(self.v5_next_tab)
     }
 }
 
@@ -363,7 +384,7 @@ fn decompress_qt(payload: &[u8]) -> Result<Vec<u8>, Error> {
         )));
     }
     let mut decoder = ZlibDecoder::new(&payload[4..]);
-    let mut output = Vec::with_capacity(expected as usize);
+    let mut output = Vec::with_capacity((expected as usize).min(MAX_INITIAL_DECOMPRESSED_CAPACITY));
     decoder
         .by_ref()
         .take(expected + 1)
