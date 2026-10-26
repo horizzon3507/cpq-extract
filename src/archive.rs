@@ -4,7 +4,9 @@ use std::io::{BufReader, Cursor, Read};
 use std::path::Path;
 
 use flate2::read::ZlibDecoder;
+use rpassword::prompt_password;
 
+use crate::crypto::EncryptionKey;
 use crate::qt::{QtReader, QtValue, StreamVersion};
 use crate::Error;
 
@@ -20,6 +22,9 @@ pub struct ArchiveReader {
     metadata: BTreeMap<String, QtValue>,
     legacy_tab_name: Option<String>,
     v3_tabs: Vec<Option<(String, Vec<u8>)>>,
+    v5_tab_names: Vec<String>,
+    v5_key: Option<EncryptionKey>,
+    v5_next_tab: usize,
     direct_tab_read: bool,
 }
 
@@ -35,6 +40,10 @@ enum ItemReaderInner<'a> {
 
 impl ArchiveReader {
     pub fn open(path: &Path) -> Result<Self, Error> {
+        Self::open_with_password(path, None)
+    }
+
+    pub fn open_with_password(path: &Path, password: Option<&str>) -> Result<Self, Error> {
         if !path.is_file() {
             return Err(Error::InvalidData(format!(
                 "input file does not exist: {}",
@@ -60,6 +69,8 @@ impl ArchiveReader {
         let mut metadata = BTreeMap::new();
         let mut legacy_tab_name = None;
         let mut v3_tabs = Vec::new();
+        let mut v5_tab_names = Vec::new();
+        let mut v5_key = None;
         match version {
             1 => legacy_tab_name = Some("clipboard".into()),
             2 => legacy_tab_name = Some(reader.read_qstring()?),
@@ -87,7 +98,35 @@ impl ArchiveReader {
             }
             4 => metadata = reader.read_qvariant_map()?,
             5 => {
-                return Err(Error::UnsupportedVersion(5));
+                reader.set_version(StreamVersion::Qt5_15);
+                let marker = reader.read_i32()?;
+                if marker == -3 {
+                    let password = match password {
+                        Some(password) => password.to_owned(),
+                        None => prompt_password("CopyQ backup password: ")?,
+                    };
+                    v5_key = Some(EncryptionKey::from_password(&password));
+                }
+                let raw_metadata =
+                    read_serialized_data_after_marker(&mut reader, marker, v5_key.as_ref())?;
+                metadata = deserialize_v5_map(raw_metadata)?;
+                let raw_names = match metadata.remove("tabs") {
+                    Some(QtValue::List(names)) => names,
+                    None => Vec::new(),
+                    _ => return Err(Error::InvalidData("invalid v5 tab list".into())),
+                };
+                if raw_names.len() > 10_000 {
+                    return Err(Error::InvalidData(
+                        "v5 archive contains more than 10,000 tabs".into(),
+                    ));
+                }
+                v5_tab_names = raw_names
+                    .into_iter()
+                    .map(|value| match value {
+                        QtValue::String(name) => Ok(name),
+                        _ => Err(Error::InvalidData("invalid v5 tab name".into())),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
             }
             _ => unreachable!(),
         }
@@ -98,6 +137,9 @@ impl ArchiveReader {
             metadata,
             legacy_tab_name,
             v3_tabs,
+            v5_tab_names,
+            v5_key,
+            v5_next_tab: 0,
             direct_tab_read: false,
         })
     }
@@ -154,7 +196,31 @@ impl ArchiveReader {
                 }
                 Ok(tab_count)
             }
-            5 => Err(Error::UnsupportedVersion(5)),
+            5 => {
+                while self.v5_next_tab < self.v5_tab_names.len() {
+                    let tab_number = self.v5_next_tab + 1;
+                    let name = self.v5_tab_names[self.v5_next_tab].clone();
+                    self.v5_next_tab += 1;
+                    let marker = self.reader.read_i32()?;
+                    let mut fields = read_serialized_data_after_marker(
+                        &mut self.reader,
+                        marker,
+                        self.v5_key.as_ref(),
+                    )?;
+                    let data = fields.remove("data").ok_or_else(|| {
+                        Error::InvalidData("missing or invalid v5 tab data".into())
+                    })?;
+                    let mut items = ItemReader::from_buffered(data)?;
+                    visit(tab_number, &name, &mut items)?;
+                    items.ensure_finished()?;
+                }
+                if !self.reader.at_end()? {
+                    return Err(Error::InvalidData(
+                        "unexpected trailing data after v5 tabs".into(),
+                    ));
+                }
+                Ok(self.v5_next_tab)
+            }
             _ => unreachable!(),
         }
     }
@@ -340,6 +406,84 @@ fn decode_mime(encoded: &str) -> Result<String, Error> {
         }
     };
     Ok(format!("{prefix}{suffix}"))
+}
+
+fn read_serialized_data_after_marker<R: Read>(
+    reader: &mut QtReader<R>,
+    marker: i32,
+    key: Option<&EncryptionKey>,
+) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+    match marker {
+        -2 => read_serialized_items(reader),
+        -3 => {
+            let key = key.ok_or_else(|| {
+                Error::InvalidData("encrypted CopyQ v5 data requires a password".into())
+            })?;
+            let encrypted_size = reader.read_i32()?;
+            if encrypted_size < 0 || encrypted_size as u64 > MAX_DATA_BLOCK {
+                return Err(Error::InvalidData("invalid encrypted v5 block size".into()));
+            }
+            let encrypted = read_limited_byte_array(reader, "encrypted v5 block")?;
+            if encrypted.len() != encrypted_size as usize {
+                return Err(Error::InvalidData(
+                    "encrypted v5 block size does not match its header".into(),
+                ));
+            }
+            let clear = crate::crypto::decrypt_envelope(&encrypted, key)?;
+            let mut inner = QtReader::new(Cursor::new(clear), StreamVersion::Qt5_15);
+            if inner.read_i32()? != -2 {
+                return Err(Error::InvalidData(
+                    "unknown serialized data marker inside encrypted block".into(),
+                ));
+            }
+            read_serialized_items(&mut inner)
+        }
+        _ => Err(Error::InvalidData(format!(
+            "unknown serialized data marker: {marker}"
+        ))),
+    }
+}
+
+fn read_serialized_items<R: Read>(
+    reader: &mut QtReader<R>,
+) -> Result<BTreeMap<String, Vec<u8>>, Error> {
+    let count = reader.read_i32()?;
+    if count < 0 || count > MAX_FORMATS {
+        return Err(Error::InvalidData(format!(
+            "invalid serialized format count: {count}"
+        )));
+    }
+    let mut values = BTreeMap::new();
+    for _ in 0..count {
+        let mut mime = decode_mime(&reader.read_qstring()?)?;
+        let compressed = reader.read_bool()?;
+        let mut payload = read_limited_byte_array(reader, "serialized value")?;
+        if compressed {
+            payload = decompress_qt(&payload)?;
+        }
+        if let Some(file_mime) = mime.strip_prefix("FILE:") {
+            mime = format!("application/x-copyq-file-reference; mime={file_mime}");
+        }
+        values.insert(mime, payload);
+    }
+    Ok(values)
+}
+
+fn deserialize_v5_map(
+    serialized: BTreeMap<String, Vec<u8>>,
+) -> Result<BTreeMap<String, QtValue>, Error> {
+    let mut result = BTreeMap::new();
+    for (name, bytes) in serialized {
+        let mut value_reader = QtReader::new(Cursor::new(bytes), StreamVersion::Qt5_15);
+        let value = value_reader.read_variant()?;
+        if !value_reader.at_end()? {
+            return Err(Error::InvalidData(format!(
+                "unexpected trailing bytes in v5 metadata value {name}"
+            )));
+        }
+        result.insert(name, value);
+    }
+    Ok(result)
 }
 
 fn take_string(value: Option<QtValue>, label: &str) -> Result<String, Error> {

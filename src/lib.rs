@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod crypto;
 pub mod qt;
 
 use std::path::Path;
