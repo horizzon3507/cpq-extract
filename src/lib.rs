@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod qt;
 
 use std::path::Path;
@@ -8,6 +9,8 @@ pub enum Error {
     InvalidData(String),
     #[error("unsupported Qt QVariant type id: {0}")]
     UnsupportedVariant(u32),
+    #[error("CopyQ archive version {0} is not supported yet")]
+    UnsupportedVersion(u8),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

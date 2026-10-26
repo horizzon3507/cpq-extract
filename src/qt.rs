@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{BufRead, Read};
 
 use base64::Engine;
 use serde_json::{Map, Number, Value};
@@ -82,6 +82,10 @@ impl<R: Read> QtReader<R> {
 
     pub fn version(&self) -> StreamVersion {
         self.version
+    }
+
+    pub fn set_version(&mut self, version: StreamVersion) {
+        self.version = version;
     }
 
     pub fn read_optional_u8(&mut self) -> Result<Option<u8>, Error> {
@@ -299,6 +303,12 @@ impl<R: Read> QtReader<R> {
 
     pub fn into_inner(self) -> R {
         self.inner
+    }
+}
+
+impl<R: BufRead> QtReader<R> {
+    pub fn at_end(&mut self) -> Result<bool, Error> {
+        Ok(self.inner.fill_buf()?.is_empty())
     }
 }
 
